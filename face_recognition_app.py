@@ -8,6 +8,23 @@ from PIL import Image, ImageTk
 import numpy as np
 import time
 import shutil
+import stat
+
+# Optional: facenet-pytorch for embeddings
+try:
+    import torch
+    from torchvision import transforms
+    from facenet_pytorch import InceptionResnetV1
+except Exception:
+    torch = None
+    transforms = None
+    InceptionResnetV1 = None
+try:
+    from pymongo import MongoClient
+    from bson.binary import Binary
+except Exception:
+    MongoClient = None
+    Binary = None
 
 class FaceRecognitionApp:
     def __init__(self, root):
@@ -21,7 +38,42 @@ class FaceRecognitionApp:
         self.mouth_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_smile.xml')
         
         self.known_faces = {}
-        self.load_known_faces()
+
+        # FaceNet / Embedding model (optional)
+        self.use_facenet = False
+        self.device = None
+        self.resnet = None
+        self.embeddings = {}
+        self.embedding_file = "face_embeddings.pkl"
+        # MongoDB settings (use env var MONGO_URI if provided)
+        self.mongo_client = None
+        self.mongo_db = None
+        self.mongo_col = None
+        # Default Mongo URI: try local MongoDB if no env var provided
+        self.mongo_uri = os.environ.get('MONGO_URI') or "mongodb://localhost:27017/face_recognition"
+        if MongoClient is not None and self.mongo_uri:
+            try:
+                self.mongo_client = MongoClient(self.mongo_uri)
+                # get_database() uses the database from URI if provided; otherwise use 'face_recognition'
+                try:
+                    self.mongo_db = self.mongo_client.get_database()
+                except Exception:
+                    self.mongo_db = self.mongo_client['face_recognition']
+                self.mongo_col = self.mongo_db.get_collection('face_embeddings')
+            except Exception:
+                self.mongo_client = None
+                self.mongo_db = None
+                self.mongo_col = None
+
+        if InceptionResnetV1 is not None:
+            try:
+                self.device = torch.device('cuda' if torch and torch.cuda.is_available() else 'cpu')
+                self.resnet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
+                self.use_facenet = True
+                # try to load existing embeddings
+                self.load_embeddings()
+            except Exception:
+                self.use_facenet = False
         
         self.current_image = None
         self.detected_faces = []
@@ -65,9 +117,10 @@ class FaceRecognitionApp:
         tk.Button(left_frame, text="📷 Camera", command=self.start_camera, **button_style).pack(pady=5)
         tk.Button(left_frame, text="⏹️ Stop Camera", command=self.stop_camera, **button_style).pack(pady=5)
         tk.Button(left_frame, text="👤 Register User", command=self.collect_dataset, **button_style).pack(pady=5)
-        tk.Button(left_frame, text="💿 Lưu dataset", command=self.save_faces, **button_style).pack(pady=5)
+        tk.Button(left_frame, text="💾 Lưu lên Mongo", command=self.save_faces, **button_style).pack(pady=5)
         tk.Button(left_frame, text="📊 FPS", command=self.toggle_fps, **button_style).pack(pady=5)
         tk.Button(left_frame, text="🔄 Refresh List", command=self.load_known_faces, **button_style).pack(pady=5)
+        tk.Button(left_frame, text="🧠 Build Embeddings", command=self.on_build_embeddings, **button_style).pack(pady=5)
         tk.Button(left_frame, text="🗑️ Delete User", command=self.delete_user, **button_style).pack(pady=5)
         tk.Button(left_frame, text="❌ Quit", command=self.quit_app, **button_style).pack(pady=5)
         
@@ -191,143 +244,313 @@ class FaceRecognitionApp:
         self.fps_counter = 0
     
     def delete_user(self):
-        if not os.path.exists("face_dataset"):
-            messagebox.showwarning("Cảnh báo", "Không có dataset")
+        # Show selection dialog with names from Mongo
+        if self.mongo_col is None:
+            messagebox.showwarning("Cảnh báo", "MongoDB chưa được kết nối. Không thể xóa user.")
             return
-            
-        users = [d for d in os.listdir("face_dataset") if os.path.isdir(os.path.join("face_dataset", d))]
+
+        try:
+            docs = list(self.mongo_col.find({}, {'name': 1}))
+            users = [d['name'] for d in docs if 'name' in d]
+        except Exception:
+            messagebox.showerror("Lỗi", "Không thể truy vấn MongoDB để lấy danh sách user")
+            return
+
         if not users:
-            messagebox.showwarning("Cảnh báo", "Không có user nào")
+            messagebox.showwarning("Cảnh báo", "Không có user nào trong MongoDB")
             return
-            
-        user_list = "\n".join([f"{i+1}. {user}" for i, user in enumerate(users)])
-        choice = tk.simpledialog.askstring("Xóa User", f"Chọn user cần xóa:\n{user_list}\n\nNhập tên:")
-        
-        if choice and choice in users:
-            result = messagebox.askyesno("Xác nhận", f"Xóa user '{choice}'?")
-            if result:
-                shutil.rmtree(os.path.join("face_dataset", choice))
-                messagebox.showinfo("Thành công", f"Xóa user '{choice}' thành công")
-                self.load_known_faces()
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Xóa User")
+        dlg.geometry("300x300")
+        tk.Label(dlg, text="Chọn user để xóa:").pack(pady=8)
+        lb = tk.Listbox(dlg)
+        lb.pack(fill=tk.BOTH, expand=True, padx=10)
+        for u in users:
+            lb.insert(tk.END, u)
+
+        def on_confirm():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showwarning("Cảnh báo", "Vui lòng chọn một user")
+                return
+            name = lb.get(sel[0])
+            if not messagebox.askyesno("Xác nhận", f"Xóa user '{name}'? Đây là hành động không thể hoàn tác."):
+                return
+
+            try:
+                self.mongo_col.delete_one({'name': name})
+            except Exception as e:
+                messagebox.showerror("Lỗi", f"Không thể xóa trong MongoDB: {e}")
+                dlg.destroy()
+                return
+
+            messagebox.showinfo("Thành công", f"Xóa user '{name}' thành công (MongoDB)")
+            dlg.destroy()
+            # reload embeddings from Mongo
+            self.load_embeddings()
+
+        btn_frame = tk.Frame(dlg)
+        btn_frame.pack(pady=8)
+        tk.Button(btn_frame, text="Xóa", command=on_confirm, bg='#e74c3c', fg='white', width=10).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Hủy", command=dlg.destroy, width=10).pack(side=tk.RIGHT, padx=6)
     
     def quit_app(self):
         self.stop_camera()
         self.root.quit()
         
     def save_faces(self):
+        # Save computed embedding(s) directly to Mongo for the current detected faces
         if self.current_image is None or len(self.detected_faces) == 0:
             messagebox.showwarning("Cảnh báo", "Vui lòng phát hiện khuôn mặt trước")
             return
-            
-        dataset_dir = "face_dataset"
-        if not os.path.exists(dataset_dir):
-            os.makedirs(dataset_dir)
-            
+
+        if not self.use_facenet or self.resnet is None:
+            messagebox.showwarning("Cảnh báo", "FaceNet chưa sẵn sàng. Hãy cài đặt 'facenet-pytorch' và 'torch'.")
+            return
+
+        if self.mongo_col is None:
+            messagebox.showwarning("Cảnh báo", "MongoDB chưa được kết nối. Không thể lưu embeddings.")
+            return
+
         name = tk.simpledialog.askstring("Tên", "Nhập tên người:")
         if not name:
             return
-            
-        person_dir = os.path.join(dataset_dir, name)
-        if not os.path.exists(person_dir):
-            os.makedirs(person_dir)
-            
-        for i, (x, y, w, h) in enumerate(self.detected_faces):
+
+        vecs = []
+        for (x, y, w, h) in self.detected_faces:
             face = self.current_image[y:y+h, x:x+w]
             face_resized = cv2.resize(face, (160, 160))
-            
-            existing_files = len([f for f in os.listdir(person_dir) if f.endswith('.jpg')])
-            filename = f"{name}_{existing_files + i + 1}.jpg"
-            filepath = os.path.join(person_dir, filename)
-            
-            cv2.imwrite(filepath, face_resized)
-            
-        messagebox.showinfo("Thành công", f"Lưu {len(self.detected_faces)} khuôn mặt vào face_dataset/{name}/")
-        self.load_known_faces()
+            emb = self._compute_embedding(face_resized)
+            if emb is not None:
+                vecs.append(emb)
+
+        if not vecs:
+            messagebox.showwarning("Lỗi", "Không thể tính embedding từ khuôn mặt đã phát hiện")
+            return
+
+        arr = np.stack(vecs)
+        try:
+            buf = __import__('io').BytesIO()
+            np.save(buf, arr, allow_pickle=False)
+            buf.seek(0)
+            bin_data = Binary(buf.read())
+            doc = {'name': name, 'embeddings': bin_data, 'dim': int(arr.shape[1]), 'count': int(arr.shape[0])}
+            self.mongo_col.replace_one({'name': name}, doc, upsert=True)
+            messagebox.showinfo("Thành công", f"Đã lưu embeddings của '{name}' lên MongoDB")
+            # reload embeddings into memory
+            self.load_embeddings()
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Không thể lưu embeddings lên MongoDB: {e}")
         
     def collect_dataset(self):
+        # Collect a few frames and compute embeddings in-memory, then save to Mongo
         name = tk.simpledialog.askstring("Tên", "Nhập tên người:")
         if not name:
             return
-            
+
+        if not self.use_facenet or self.resnet is None:
+            messagebox.showwarning("Cảnh báo", "FaceNet chưa sẵn sàng. Hãy cài đặt 'facenet-pytorch' và 'torch'.")
+            return
+
+        if self.mongo_col is None:
+            messagebox.showwarning("Cảnh báo", "MongoDB chưa được kết nối. Không thể lưu embeddings.")
+            return
+
         self.collect_name = name
         self.collect_count = 0
         self.collecting = True
-        
-        dataset_dir = os.path.join("face_dataset", name)
-        if not os.path.exists(dataset_dir):
-            os.makedirs(dataset_dir)
-            
+
         cap = cv2.VideoCapture(0)
-        
+        collected_vecs = []
+
         def collect_frame():
             ret, frame = cap.read()
             if ret and self.collecting:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
-                
+
                 for (x, y, w, h) in faces:
                     cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    
-                    if self.collect_count % 10 == 0 and self.collect_count < 500:
+
+                    if self.collect_count % 10 == 0 and len(collected_vecs) < 50:
                         face = frame[y:y+h, x:x+w]
                         face_resized = cv2.resize(face, (160, 160))
-                        filename = f"{name}_{self.collect_count//10 + 1}.jpg"
-                        filepath = os.path.join(dataset_dir, filename)
-                        cv2.imwrite(filepath, face_resized)
-                        
+                        emb = self._compute_embedding(face_resized)
+                        if emb is not None:
+                            collected_vecs.append(emb)
+
                     self.collect_count += 1
-                
-                cv2.putText(frame, f"Collected: {self.collect_count//10}/50", (10, 30), 
+
+                cv2.putText(frame, f"Collected: {len(collected_vecs)}/50", (10, 30), 
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                
+
                 self.display_image(frame)
-                
-                if self.collect_count < 500:
+
+                if len(collected_vecs) < 50 and self.collect_count < 500:
                     self.root.after(30, collect_frame)
                 else:
                     cap.release()
                     self.collecting = False
-                    messagebox.showinfo("Hoàn thành", f"Thu thập xong 50 ảnh cho {name}")
-                    self.load_known_faces()
+                    if not collected_vecs:
+                        messagebox.showwarning("Lỗi", "Không thu thập được embedding nào")
+                        return
+                    arr = np.stack(collected_vecs)
+                    try:
+                        buf = __import__('io').BytesIO()
+                        np.save(buf, arr, allow_pickle=False)
+                        buf.seek(0)
+                        bin_data = Binary(buf.read())
+                        doc = {'name': name, 'embeddings': bin_data, 'dim': int(arr.shape[1]), 'count': int(arr.shape[0])}
+                        self.mongo_col.replace_one({'name': name}, doc, upsert=True)
+                        messagebox.showinfo("Hoàn thành", f"Đã lưu embeddings cho {name} lên MongoDB")
+                        self.load_embeddings()
+                    except Exception as e:
+                        messagebox.showerror("Lỗi", f"Không thể lưu embeddings lên MongoDB: {e}")
             else:
                 cap.release()
-                
+
         collect_frame()
         
     def load_known_faces(self):
+        # No-op: dataset-based known faces deprecated.
+        # Use `load_embeddings()` to refresh embeddings from MongoDB instead.
         self.known_faces = {}
-        face_dataset_dir = "face_dataset"
-        
-        if not os.path.exists(face_dataset_dir):
-            return
-            
-        for person_name in os.listdir(face_dataset_dir):
-            person_dir = os.path.join(face_dataset_dir, person_name)
-            if os.path.isdir(person_dir):
-                face_encodings = []
-                for img_file in os.listdir(person_dir):
-                    if img_file.endswith(('.jpg', '.png')):
-                        img_path = os.path.join(person_dir, img_file)
-                        img = cv2.imread(img_path)
-                        if img is not None:
-                            face_encodings.append(img)
-                            
-                if face_encodings:
-                    self.known_faces[person_name] = face_encodings
+        self.load_embeddings()
                     
     def recognize_face(self, face_img):
-        face_resized = cv2.resize(face_img, (160, 160))
-        
-        for name, known_faces in self.known_faces.items():
-            for known_face in known_faces:
-                hist1 = cv2.calcHist([face_resized], [0, 1, 2], None, [50, 50, 50], [0, 256, 0, 256, 0, 256])
-                hist2 = cv2.calcHist([known_face], [0, 1, 2], None, [50, 50, 50], [0, 256, 0, 256, 0, 256])
-                
-                similarity = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
-                if similarity > 0.7:
-                    return name
-                    
-        return "Unknown"
+        # Only use FaceNet embeddings loaded from MongoDB
+        if not self.use_facenet or not self.embeddings:
+            return "Unknown"
+
+        try:
+            emb = self._compute_embedding(face_img)
+            if emb is None:
+                return "Unknown"
+
+            best_name = "Unknown"
+            best_dist = float('inf')
+            for name, vecs in self.embeddings.items():
+                dists = np.linalg.norm(vecs - emb, axis=1)
+                min_dist = float(np.min(dists))
+                if min_dist < best_dist:
+                    best_dist = min_dist
+                    best_name = name
+
+            if best_dist < 0.9:
+                return best_name
+            return "Unknown"
+        except Exception:
+            return "Unknown"
+
+    def _compute_embedding(self, face_img):
+        """Compute FaceNet embedding for a single face image (numpy BGR)"""
+        if not self.use_facenet or self.resnet is None:
+            return None
+
+        try:
+            # convert BGR (OpenCV) to RGB
+            rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+            pil = Image.fromarray(rgb).resize((160, 160))
+
+            # to tensor and normalize to [-1, 1]
+            if transforms is not None:
+                tf = transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+                ])
+                img_t = tf(pil).unsqueeze(0).to(self.device)
+            else:
+                # basic numpy fallback
+                arr = np.asarray(pil).astype(np.float32) / 255.0
+                arr = (arr - 0.5) / 0.5
+                arr = np.transpose(arr, (2, 0, 1))
+                img_t = torch.from_numpy(arr).unsqueeze(0).to(self.device)
+
+            with torch.no_grad():
+                emb = self.resnet(img_t)
+            emb = emb.cpu().numpy().reshape(-1)
+            return emb
+        except Exception:
+            return None
+
+    def build_embeddings(self):
+        # Deprecated: building from local dataset is removed. Embeddings must be stored in Mongo.
+        return False
+
+    def load_embeddings(self):
+        # Load embeddings exclusively from MongoDB
+        self.embeddings = {}
+        if self.mongo_col is None:
+            return False
+        try:
+            docs = list(self.mongo_col.find({}))
+            data = {}
+            for doc in docs:
+                name = doc.get('name')
+                bin_data = doc.get('embeddings')
+                if name and bin_data:
+                    buf = __import__('io').BytesIO(bin_data)
+                    buf.seek(0)
+                    arr = np.load(buf, allow_pickle=False)
+                    data[name] = arr
+            if data:
+                self.embeddings = data
+                return True
+        except Exception:
+            self.embeddings = {}
+        return False
+
+    def _safe_rmtree(self, path):
+        """Recursively remove a directory on Windows, clearing read-only flags if needed."""
+        if not os.path.exists(path):
+            return
+
+        # Walk files and ensure writable, then remove
+        for root, dirs, files in os.walk(path, topdown=False):
+            for name in files:
+                filename = os.path.join(root, name)
+                try:
+                    os.chmod(filename, stat.S_IWRITE)
+                except Exception:
+                    pass
+            for name in dirs:
+                dirname = os.path.join(root, name)
+                try:
+                    os.chmod(dirname, stat.S_IWRITE)
+                except Exception:
+                    pass
+
+        # Try shutil.rmtree now
+        try:
+            shutil.rmtree(path)
+        except PermissionError:
+            # Second attempt: remove files individually
+            for root, dirs, files in os.walk(path, topdown=False):
+                for name in files:
+                    filename = os.path.join(root, name)
+                    try:
+                        os.chmod(filename, stat.S_IWRITE)
+                        os.remove(filename)
+                    except Exception:
+                        pass
+                for name in dirs:
+                    dirname = os.path.join(root, name)
+                    try:
+                        os.chmod(dirname, stat.S_IWRITE)
+                        os.rmdir(dirname)
+                    except Exception:
+                        pass
+            # finally try to remove the root
+            if os.path.exists(path):
+                try:
+                    os.rmdir(path)
+                except Exception as e:
+                    raise e
+
+    def on_build_embeddings(self):
+        """GUI handler to build embeddings and notify user."""
+        messagebox.showinfo("Không khả dụng", "Tính năng này đã bị vô hiệu: embeddings giờ chỉ lưu trực tiếp lên MongoDB khi Register/Save.")
 
 if __name__ == "__main__":
     root = tk.Tk()
