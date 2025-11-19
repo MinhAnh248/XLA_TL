@@ -1,4 +1,4 @@
 opencv-python
-tensorflow
 Pillow
 numpy
+Flask==2.3.3
